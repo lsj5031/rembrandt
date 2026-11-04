@@ -21,8 +21,9 @@ Every command takes `--json` for output a program can read.
 
 ## Backend
 
-Rembrandt posts to an OpenAI-compatible `POST /v1/images/generations` and
-reads `data[0].b64_json`. Any compatible service works. The in-app Backend
+Rembrandt posts to an OpenAI-compatible `POST /v1/images/generations`, or
+`POST /v1/images/edits` with JSON data URLs when reference images are attached,
+and reads `data[0].b64_json`. Any compatible service works. The in-app Backend
 sheet changes the base URL, model and API key; environment values are the
 defaults:
 
@@ -32,6 +33,7 @@ defaults:
 | `REMBRANDT_API_KEY` | empty (no Authorization header) |
 | `REMBRANDT_MODEL` | empty (server default) |
 | `REMBRANDT_SIZE` | `1536x1024` |
+| `REMBRANDT_REFERENCES` | empty; preload paths separated by `;` on Windows or `:` on macOS/Linux |
 
 Base URL, model and size persist in `%APPDATA%\Rembrandt\settings.json` (or
 the platform's app-data directory); the API key is memory-only. Results go to
@@ -39,6 +41,10 @@ the platform's app-data directory); the API key is memory-only. Results go to
 
 `REMBRANDT_PROMPT` prefills the composer, and `REMBRANDT_DEMO_IMAGE` preloads
 a PNG into the recent list; both are for snapshots and manual checking.
+References accept PNG/JPEG/WebP: 16 files, 14 MiB each, 40 MiB combined.
+They are not persisted. Changes during generation apply to the next request;
+there is no automatic retry with multipart or generations after an edits error.
+Python examples in `docs/reference-images-plan.md` cover portable probes.
 
 The running app writes a synchronous log to
 `%LOCALAPPDATA%\Rembrandt\rembrandt.log` (previous run as `.1`), or the path
@@ -73,6 +79,12 @@ by `assets/rembrandt.rc`.
   `ui.key(c, …)` for items in lists.
 - **Every behavior gets a test** in `src/tests.zig`: `t.clickText`,
   `t.typeText`, `t.hasText`, `t.screenshot("/tmp/x.png")`.
+- Actual Generate tests in `src/tests_generation.zig` use an ephemeral
+  loopback server and temporary saves; they never call the real backend.
+- Reference removal/Clear is deferred until the next view, before drawing:
+  `ui.image` retains the previous view's source bytes until painting finishes.
+  Guard PNG thumbnail dimensions before calling it; a small display size does
+  not bound decoding memory.
 - **Keep files under 600 lines.** `app.zig` is near the limit; put
   persistence/parsing in `src/settings_store.zig` or `src/backend.zig`.
 - Script steps for `--script`: `click:TEXT`, `type:TEXT`, `key:enter`,
@@ -93,9 +105,12 @@ src/win_frame.zig    Windows caption removal, drag hit testing, icon
 src/settings_store.zig persisted base URL/model/size (never the key)
 src/log.zig          synchronous file log for the running app
 src/backend.zig      OpenAI-compatible config, JSON and PNG decoding
+src/generation.zig   request submission, callback and saving
+src/references.zig   owned reference bytes, input limits and drop paths
 src/theme.zig        the paper/pine palette
 src/mark.svg         the header mark
 src/tests.zig        the view's tests
+src/tests_generation.zig real Generate requests against a loopback stub
 ```
 
 nanoui's README lists the widgets (`ui.div(c).row().gap(8)…`, text,

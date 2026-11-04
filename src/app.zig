@@ -11,6 +11,7 @@ const log = @import("log.zig");
 const settings_store = @import("settings_store.zig");
 const theme = @import("theme.zig");
 const controls = @import("controls.zig");
+const references = @import("references.zig");
 const Caption = controls.Caption;
 const captionButton = controls.captionButton;
 const primaryButton = controls.primaryButton;
@@ -28,6 +29,10 @@ pub const State = struct {
     /// `%APPDATA%\Rembrandt\settings.json`; null when there is no data dir.
     config_path: ?[]u8 = null,
     prompt: ui.TextBuffer = .{},
+    refs: references.List = .{},
+    ref_action: controls.RefAction = .none,
+    /// Caller-owned override for isolated generation checks; null uses Documents.
+    output_dir: ?[]const u8 = null,
 
     history: [8]backend.Item = undefined,
     count: usize = 0,
@@ -58,6 +63,8 @@ pub const State = struct {
         log.info("settings: base={s} model={s} size={s}", .{ s.config.base_url, s.config.model, s.config.size.api() });
         if (env.get("REMBRANDT_PROMPT")) |p| s.prompt.set(p);
         s.loadDemo(env) catch {};
+        s.refs.loadEnv(gpa, io, env);
+        log.info("references loaded: {d}", .{s.refs.items.items.len});
         return s;
     }
 
@@ -76,6 +83,7 @@ pub const State = struct {
             s.gpa.free(s.history[i].path);
         }
         s.config.deinit(s.gpa);
+        s.refs.deinit(s.gpa);
         if (s.config_path) |p| s.gpa.free(p);
         s.prompt.deinit();
         s.url_buf.deinit();
@@ -84,6 +92,9 @@ pub const State = struct {
     }
 
     pub fn view(s: *State, c: *ui.Context) void {
+        const action = s.ref_action;
+        s.ref_action = .none;
+        s.referenceAction(action, c);
         c.theme = theme.paper;
         c.title_bar_height = theme.header_h;
         if (s.generating) {
@@ -140,6 +151,23 @@ pub const State = struct {
     fn composer(s: *State, c: *ui.Context) void {
         const col = ui.div(c).column().w(420).gap(12);
         defer col.end();
+        c.acceptDrop(col.index);
+        // Apply drops after drawing, so retained image bytes live through this frame.
+        defer if (c.dropAt(col.index)) |drop| {
+            var failure: ?anyerror = null;
+            for (drop.urls) |url| {
+                const path = references.pathFromUrl(s.gpa, url) catch |e| {
+                    failure = e;
+                    continue;
+                } orelse continue;
+                defer s.gpa.free(path);
+                s.refs.addPath(s.gpa, s.io, path) catch |e| {
+                    failure = e;
+                };
+            }
+            if (failure) |e| s.refs.setError(e);
+            c.changed = true;
+        };
 
         smallLabel(c, "PROMPT");
         const result = ui.textArea(c, &s.prompt, .{
@@ -152,6 +180,11 @@ pub const State = struct {
         });
         if (result.submitted and !s.generating) s.generate();
 
+        s.ref_action = controls.referenceStrip(c, s.refs.items.items, s.refs.limits.max_refs);
+        // ui.image retains its bytes through paint; free removed refs next frame.
+        if (s.ref_action != .none) c.changed = true;
+        if (s.refs.error_len > 0) ui.text(c, s.refs.error_text[0..s.refs.error_len], .{ .size = 11, .color = theme.danger });
+        if (s.generating) ui.text(c, "Reference changes apply to the next generation.", .{ .size = 11, .color = theme.stone });
         ui.divider(c);
 
         const chips = ui.div(c).row().itemsCenter().gap(8);
@@ -159,6 +192,7 @@ pub const State = struct {
         var model_buf: [32]u8 = undefined;
         if (chip(c, s.config.modelShort(&model_buf), true)) s.openSettings();
         if (chip(c, s.config.size.label(), true)) s.cycleSize();
+        if (link(c, "+ Reference")) s.chooseReferences(c);
         ui.text(c, "1 image", .{ .size = 12, .color = theme.stone });
         chips.end();
 
@@ -253,7 +287,7 @@ pub const State = struct {
         }
         frame.end();
 
-        if (s.count > 0 and s.error_len == 0 and !s.generating) {
+        if (s.count > 0 and s.error_len == 0) {
             const it = &s.history[s.selected];
             const meta = ui.div(c).row().wFull().itemsCenter().gap(12);
 
@@ -264,6 +298,10 @@ pub const State = struct {
             info.end();
 
             ui.spacer(c);
+            if (link(c, "Use as reference")) {
+                s.refs.addBytes(s.gpa, it.name, it.bytes) catch |e| s.refs.setError(e);
+                c.changed = true;
+            }
             if (link(c, "Copy path")) nanoui.clipboard.writeText(it.path);
             if (link(c, "Open")) _ = nanoui.shell.openPath(it.path);
             meta.end();
@@ -396,7 +434,7 @@ pub const State = struct {
         if (s.config_path) |path| settings_store.save(s.gpa, s.io, path, &s.config) catch {};
     }
 
-    fn hasPrompt(s: *State) bool {
+    pub fn hasPrompt(s: *State) bool {
         return std.mem.trim(u8, s.prompt.text(), " \t\r\n").len > 0;
     }
 
@@ -420,117 +458,34 @@ pub const State = struct {
         });
     }
 
-    fn generate(s: *State) void {
-        if (s.generating or !s.hasPrompt()) return;
-        const prompt = std.mem.trim(u8, s.prompt.text(), " \t\r\n");
+    pub const generate = @import("generation.zig").generate;
 
-        const req_body = backend.buildBody(s.gpa, &s.config, prompt) catch {
-            s.setError("Could not build the request.");
+    fn chooseReferences(s: *State, c: *ui.Context) void {
+        const paths = nanoui.dialog.open(s.gpa, .{ .title = "Add reference images", .button = "Add", .extensions = &.{ "png", "jpg", "jpeg", "webp" }, .multiple = true }) catch |e| {
+            s.refs.setError(e);
+            c.changed = true;
             return;
+        } orelse return;
+        defer nanoui.dialog.freePaths(s.gpa, paths);
+        var failure: ?anyerror = null;
+        for (paths) |path| s.refs.addPath(s.gpa, s.io, path) catch |e| {
+            failure = e;
         };
-        defer s.gpa.free(req_body);
-
-        const url = std.fmt.allocPrint(s.gpa, "{s}/images/generations", .{s.config.base_url}) catch {
-            s.setError("Could not build the request.");
-            return;
-        };
-        defer s.gpa.free(url);
-
-        var headers: [2]nanoui.http.Header = undefined;
-        var hn: usize = 0;
-        headers[hn] = .{ .name = "Content-Type", .value = "application/json" };
-        hn += 1;
-
-        var auth: ?[]u8 = null;
-        defer if (auth) |a| s.gpa.free(a);
-        if (s.config.api_key.len > 0) {
-            auth = std.fmt.allocPrint(s.gpa, "Bearer {s}", .{s.config.api_key}) catch null;
-            if (auth) |a| {
-                headers[hn] = .{ .name = "Authorization", .value = a };
-                hn += 1;
-            }
-        }
-
-        log.info("generate: model={s} size={s} prompt_chars={d}", .{ if (s.config.model.len == 0) "server default" else s.config.model, s.config.size.api(), prompt.len });
-        s.clearError();
-        s.generating = true;
-        s.started_at = ui.clock.now();
-        s.elapsed = 0;
-        if (s.window) |w| w.redraw();
-
-        nanoui.http.fetch(s.gpa, .{
-            .url = url,
-            .method = "POST",
-            .headers = headers[0..hn],
-            .body = req_body,
-            .timeout = 240,
-        }, s, State.onGenerated);
+        if (failure) |e| s.refs.setError(e);
+        c.changed = true;
     }
 
-    fn onGenerated(s: *State, r: nanoui.http.Response) void {
-        defer {
-            if (s.window) |w| w.redraw();
+    fn referenceAction(s: *State, action: controls.RefAction, c: *ui.Context) void {
+        switch (action) {
+            .none => return,
+            .add => s.chooseReferences(c),
+            .remove => |i| s.refs.remove(s.gpa, i),
+            .clear => s.refs.clear(s.gpa),
         }
-        s.generating = false;
-
-        var arena = std.heap.ArenaAllocator.init(s.gpa);
-        defer arena.deinit();
-
-        if (r.status != 200) {
-            const msg = if (r.body.len > 0) backend.errorMessage(arena.allocator(), r.body) else r.err;
-            s.setError(if (msg.len > 0) msg else "The backend did not answer.");
-            return;
-        }
-
-        const parsed = backend.parse(arena.allocator(), r.body) catch {
-            s.setError("The backend sent no image.");
-            return;
-        };
-        const image = backend.decodePng(s.gpa, parsed.b64) catch {
-            s.setError("Could not decode the image.");
-            return;
-        };
-        const stamp = std.Io.Clock.real.now(s.io).toSeconds();
-        const name = std.fmt.allocPrint(s.gpa, "rembrandt-{d}.png", .{stamp}) catch {
-            s.gpa.free(image.bytes);
-            s.setError("Out of memory.");
-            return;
-        };
-        const path = s.saveImage(name, image.bytes) catch s.gpa.dupe(u8, name) catch {
-            s.gpa.free(image.bytes);
-            s.gpa.free(name);
-            s.setError("Could not save the image.");
-            return;
-        };
-
-        const secs = ui.clock.now() - s.started_at;
-        log.info("generated: {d}x{d}, {d} tokens, {d:.1}s, saved to {s}", .{ image.width, image.height, parsed.tokens, secs, path });
-        s.addItem(.{
-            .bytes = image.bytes,
-            .name = name,
-            .path = path,
-            .width = image.width,
-            .height = image.height,
-            .tokens = parsed.tokens,
-            .secs = secs,
-        });
-        s.clearError();
+        c.changed = true;
     }
 
-    /// `~/Documents/Rembrandt/rembrandt-NNN.png`, falling back to the cwd.
-    fn saveImage(s: *State, name: []const u8, bytes: []const u8) ![]u8 {
-        const documents = try nanoui.path(s.gpa, .documents, "Rembrandt");
-        defer s.gpa.free(documents);
-        const directory = try std.fs.path.join(s.gpa, &.{ documents, "Rembrandt" });
-        defer s.gpa.free(directory);
-        try std.Io.Dir.cwd().createDirPath(s.io, directory);
-        const path = try std.fs.path.join(s.gpa, &.{ directory, name });
-        errdefer s.gpa.free(path);
-        try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = path, .data = bytes });
-        return path;
-    }
-
-    fn addItem(s: *State, item: backend.Item) void {
+    pub fn addItem(s: *State, item: backend.Item) void {
         if (s.count == s.history.len) {
             const oldest = s.history[s.count - 1];
             s.gpa.free(oldest.bytes);
@@ -545,14 +500,14 @@ pub const State = struct {
         s.selected = 0;
     }
 
-    fn setError(s: *State, msg: []const u8) void {
+    pub fn setError(s: *State, msg: []const u8) void {
         const n = @min(msg.len, s.error_text.len);
         @memcpy(s.error_text[0..n], msg[0..n]);
         s.error_len = n;
         log.err("error: {s}", .{s.error_text[0..n]});
     }
 
-    fn clearError(s: *State) void {
+    pub fn clearError(s: *State) void {
         s.error_len = 0;
     }
 };

@@ -40,6 +40,21 @@ until a service is configured.
 4. The result appears on the right. It is added to **Recent** for this
    session.
 
+To guide the result with images, click **+ Reference** or the **+** tile and
+choose a PNG, JPEG, or WebP. You can also drop files onto the composer on
+macOS, or click **Use as reference** below a previous result. Windows' file
+picker currently adds one file per dialog.
+
+Attach up to 16 images, at most 14 MiB each and 40 MiB combined. Click a
+tile's **×** to remove it, or **Clear** to remove all references. Images
+remain attached after Generate; changes made during generation apply to
+the next request. A text prompt is still required. References are copied
+into memory and are not restored after restarting the app.
+
+JPEG/WebP references show format tiles on Windows/Linux. Large PNGs also
+show a format tile to avoid expensive preview decoding; their original
+bytes still reach the backend.
+
 Each generated image is saved as:
 
 ```text
@@ -53,6 +68,7 @@ preview are per session, so they start empty the next time you launch the app.
 
 Below the preview you can:
 
+- **Use as reference** — attach a copy of this result to the next prompt.
 - **Copy path** — copy the full PNG path to the clipboard.
 - **Open** — open the PNG in your default image viewer.
 - Click a **Recent** row to show that image in the preview again.
@@ -85,6 +101,9 @@ after restarting the app.
 Your backend must:
 
 - accept `POST <base URL>/images/generations`;
+- for reference images, accept `POST <base URL>/images/edits` with JSON
+  `images: [{"image_url":"data:image/png;base64,..."}]` (PNG, JPEG, or WebP;
+  up to 16 images);
 - return an OpenAI-compatible response containing a PNG in
   `data[0].b64_json`.
 
@@ -121,6 +140,7 @@ export REMBRANDT_MODEL="your-model"
 | `REMBRANDT_API_KEY` | Bearer token sent to the service. |
 | `REMBRANDT_MODEL` | Model name; leave empty for the server default. |
 | `REMBRANDT_SIZE` | `1536x1024`, `1024x1024`, or `1024x1536`. |
+| `REMBRANDT_REFERENCES` | Reference file paths to preload; separated by `;` on Windows or `:` on macOS/Linux. |
 
 ## Screenshots and walkthrough
 
@@ -153,7 +173,25 @@ Check, in order:
 
 ### Generate looks disabled
 
-Type a prompt first. The button becomes available when the prompt is not empty.
+Type a prompt first, even when references are attached. The button becomes
+available when the prompt is not empty and no request is in progress.
+
+### My backend rejects edits
+
+Check the backend error and whether it implements `/images/edits` for the
+selected model. Some services accept multipart edits but do not implement
+JSON edits with data URLs. This version uses JSON; there is no automatic
+multipart or text-only retry. See the probe in
+[the reference images plan](docs/reference-images-plan.md#api-contract) to
+distinguish format errors from authentication, model, or missing-route errors.
+
+### A reference will not attach
+
+Check the image's actual format (PNG, JPEG, or WebP), the 16-image count,
+14 MiB per-file limit, and 40 MiB combined limit. Empty files and unsupported
+formats are rejected with an error below the reference strip. Renaming a
+file's extension does not change its format. A format tile is an attached
+image whose thumbnail is unavailable; it does not indicate an upload failure.
 
 ### The API key disappears after restart
 
@@ -234,7 +272,7 @@ For development, `zig build` without the flag creates a Debug build. If
 
 ## Development
 
-Run the offscreen tests (no window, no network):
+Run the offscreen tests (no window; generation tests use loopback HTTP only):
 
 ```sh
 zig build test -Doptimize=ReleaseFast
@@ -254,6 +292,9 @@ nui snapshot --out shot.png
 ```
 
 `REMBRANDT_PROMPT` pre-fills the composer for snapshots.
+`REMBRANDT_REFERENCES` preloads reference paths using the host platform's
+path-list delimiter. The plan includes Python 3 examples for a portable
+backend probe and headless generation check.
 
 ### Layout
 
@@ -267,11 +308,14 @@ src/app.zig          state and the whole view
 src/controls.zig     shared buttons, chips, and press feedback
 src/win_frame.zig    Windows caption removal, drag regions, window icon
 src/backend.zig      endpoint config, request/response, PNG helpers
+src/generation.zig   submission and saving the generated result
+src/references.zig   owned reference bytes, limits, and drop paths
 src/settings_store.zig persisted base URL/model/size (never the key)
 src/log.zig          synchronous run log
 src/theme.zig        paper/pine palette
 src/mark.svg         header and empty-state mark
 src/tests.zig        offscreen view tests
+src/tests_generation.zig actual Generate requests against a loopback stub
 docs/media/          README screenshots, GIF preview, and walkthrough video
 ```
 

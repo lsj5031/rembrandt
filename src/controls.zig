@@ -102,3 +102,51 @@ pub fn link(c: *ui.Context, label: []const u8) bool {
     ui.text(c, label, .{ .size = 12, .weight = .medium, .color = theme.pine });
     return d.clicked();
 }
+
+pub const RefAction = union(enum) { none, add, remove: usize, clear };
+
+pub fn referenceStrip(c: *ui.Context, items: []const @import("references.zig").Ref, max: usize) RefAction {
+    const strip = ui.div(c).column().wFull().gap(6);
+    defer strip.end();
+    var action: RefAction = .none;
+    const head = ui.div(c).row().wFull().itemsCenter().gap(8);
+    smallLabel(c, "REFERENCES");
+    ui.text(c, c.print("{d} / {d}", .{ items.len, max }), .{ .size = 10, .color = theme.stone });
+    ui.spacer(c);
+    if (items.len > 0 and link(c, "Clear")) action = .clear;
+    head.end();
+    const tiles = items.len + @intFromBool(items.len < max);
+    var start: usize = 0;
+    while (start < tiles) : (start += 8) {
+        const row = ui.div(c).row().gap(6);
+        for (start..@min(start + 8, tiles)) |i| {
+            if (i == items.len) {
+                ui.key(c, "reference-add");
+                const add = ui.div(c).w(40).h(40).rounded(8).border(theme.border).borderW(1)
+                    .dashed().center().control().hover(theme.hover);
+                if (add.clicked()) action = .add;
+                c.help(add.index, "Add reference images");
+                ui.text(c, "+", .{ .size = 16, .color = theme.pine });
+                add.end();
+                continue;
+            }
+            const ref = items[i];
+            const key = c.print("reference-{d}", .{ref.id});
+            ui.key(c, key);
+            const tile = ui.div(c).w(40).h(40).rounded(8).bg(theme.thumb).border(theme.border).borderW(1).clip().center();
+            const shown = ref.canPreview() and ui.image(c, .{ .key = key, .bytes = ref.bytes, .max_width = 40, .max_height = 40, .radius = 8, .scale = 1 });
+            if (!shown) ui.text(c, ref.mime.label(), .{ .size = 9, .color = theme.stone });
+            c.help(tile.index, if (ref.mime == .png and !ref.canPreview()) "Large or unavailable PNG preview; image remains attached" else ref.name);
+            const remove = ui.div(c).absolute().offset(26, 0).w(14).h(14).rounded(4)
+                .bg(theme.paper.surface).center().control().hover(theme.selected);
+            if (remove.clicked()) action = .{ .remove = i };
+            c.help(remove.index, "Remove reference");
+            c.addA11y(remove.index, .button, "Remove reference", "", false, true);
+            ui.icon(c, "xmark", .{ .size = 9, .color = theme.stone });
+            remove.end();
+            tile.end();
+        }
+        row.end();
+    }
+    return action;
+}

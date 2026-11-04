@@ -1,7 +1,7 @@
 //! The OpenAI-compatible image backend Rembrandt talks to. It answers
-//! POST /v1/images/generations with a b64_json PNG; that response is all this
-//! needs to know about the service behind it.
+//! generations or reference-image edits with a b64_json PNG.
 const std = @import("std");
+const references = @import("references.zig");
 
 const default_base = "http://127.0.0.1:3425/v1";
 const default_key = "";
@@ -150,12 +150,14 @@ pub const Parsed = struct {
 };
 
 /// "http://127.0.0.1:3425" and ".../v1" both become ".../v1"; a full
-/// endpoint pasted in loses its /images/generations.
+/// endpoint pasted in loses its /images/generations or /images/edits.
 pub fn normalize(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     var s = std.mem.trim(u8, raw, " \t\r\n");
     if (s.len == 0) s = default_base;
-    if (std.mem.endsWith(u8, s, "/images/generations")) s = s[0 .. s.len - "/images/generations".len];
     while (s.len > 0 and s[s.len - 1] == '/') s = s[0 .. s.len - 1];
+    inline for (.{ "/images/generations", "/images/edits" }) |suffix| {
+        if (std.mem.endsWith(u8, s, suffix)) s = s[0 .. s.len - suffix.len];
+    }
     if (std.mem.endsWith(u8, s, "/v1")) return gpa.dupe(u8, s);
     return std.fmt.allocPrint(gpa, "{s}/v1", .{s});
 }
@@ -169,6 +171,40 @@ pub fn buildBody(gpa: std.mem.Allocator, cfg: *const Config, prompt: []const u8)
     const m = try escapeJson(gpa, cfg.model);
     defer gpa.free(m);
     return std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"prompt\":\"{s}\",\"n\":{d},\"size\":\"{s}\"}}", .{ m, p, cfg.n, cfg.size.api() });
+}
+
+pub const RefInput = struct { bytes: []const u8, mime: []const u8 };
+
+pub fn endpointFor(has_refs: bool) []const u8 {
+    return if (has_refs) "/images/edits" else "/images/generations";
+}
+
+pub fn buildEditBody(gpa: std.mem.Allocator, cfg: *const Config, prompt: []const u8, refs: []const RefInput) ![]u8 {
+    if (refs.len == 0) return error.NoReferences;
+    if (refs.len > 16) return error.TooMany;
+    var capacity: usize = 0;
+    for (refs) |ref| {
+        try references.checkEncodedSize(ref.bytes.len, ref.mime);
+        capacity += std.base64.standard.Encoder.calcSize(ref.bytes.len) + ref.mime.len + 40;
+    }
+    const base = try buildBody(gpa, cfg, prompt);
+    defer gpa.free(base);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.ensureTotalCapacityPrecise(gpa, base.len + capacity + 16);
+    try out.appendSlice(gpa, base[0 .. base.len - 1]);
+    try out.appendSlice(gpa, ",\"images\":[");
+    for (refs, 0..) |ref, i| {
+        if (i > 0) try out.append(gpa, ',');
+        try out.appendSlice(gpa, "{\"image_url\":\"data:");
+        try out.appendSlice(gpa, ref.mime);
+        try out.appendSlice(gpa, ";base64,");
+        const dst = try out.addManyAsSlice(gpa, std.base64.standard.Encoder.calcSize(ref.bytes.len));
+        _ = std.base64.standard.Encoder.encode(dst, ref.bytes);
+        try out.appendSlice(gpa, "\"}");
+    }
+    try out.appendSlice(gpa, "]}");
+    return out.toOwnedSlice(gpa);
 }
 
 pub fn escapeJson(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
