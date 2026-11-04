@@ -1,0 +1,19 @@
+# Zig build output and package cache
+zig-out/
+.zig-cache/
+zig-pkg/
+
+# Local environment and settings files
+.env
+.env.*
+!.env.example
+settings.json
+*.local
+
+# Local snapshots, scratch renders, and logs
+/*.png
+/*.jpg
+*.log
+
+# Generated from assets/rembrandt.svg during icon work
+/assets/rembrandt-1024.png

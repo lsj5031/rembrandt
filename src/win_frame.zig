@@ -1,0 +1,188 @@
+//! The window's frame on Windows, after nanomon's win_frame.zig. Rembrandt's
+//! header is the title bar, so the system's caption would sit above it as a
+//! second, empty bar. This takes it away: the client area fills the window,
+//! the header carries the window buttons (app.zig's caption), and the rest
+//! of the header drags the window. The resize edges, shadow and Windows 11's
+//! rounded corners stay.
+const std = @import("std");
+
+const ui = @import("nanoui").ui;
+const theme = @import("theme.zig");
+
+pub const caption_w: f32 = theme.caption_w;
+
+/// The view's context. Its last committed frame says where the header's
+/// controls are; hit tests read it as they come.
+var hit_ctx: ?*const ui.Context = null;
+
+pub fn setContext(ctx: *const ui.Context) void {
+    hit_ctx = ctx;
+}
+
+/// Whether the header's point (x, y), in points, is over a control the view
+/// painted. The header's rest drags the window, as a caption would.
+pub fn overControl(x: f32, y: f32) bool {
+    const c = hit_ctx orelse return false;
+    for (c.hits.items) |hit| {
+        const r = hit.rect;
+        if (r.w <= 0 or r.h <= 0 or r.y >= theme.header_h) continue;
+        if (x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h) return true;
+    }
+    return false;
+}
+
+const HWND = *anyopaque;
+const WPARAM = usize;
+const LPARAM = isize;
+const LRESULT = isize;
+const WNDPROC = *const fn (HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+
+const RECT = extern struct { left: i32 = 0, top: i32 = 0, right: i32 = 0, bottom: i32 = 0 };
+const POINT = extern struct { x: i32 = 0, y: i32 = 0 };
+const MARGINS = extern struct { left: i32, right: i32, top: i32, bottom: i32 };
+const MONITORINFO = extern struct {
+    cb_size: u32 = @sizeOf(MONITORINFO),
+    monitor: RECT = .{},
+    work: RECT = .{},
+    flags: u32 = 0,
+};
+const NCCALCSIZE_PARAMS = extern struct {
+    /// The proposed client rects, the first kept.
+    rgrc: [3]RECT,
+    pos: ?*anyopaque,
+};
+
+const WM_SETICON = 0x0080;
+const WM_NCCALCSIZE = 0x0083;
+const WM_NCHITTEST = 0x0084;
+const GWLP_WNDPROC = -4;
+const SWP_NOSIZE = 0x0001;
+const SWP_NOMOVE = 0x0002;
+const SWP_NOZORDER = 0x0004;
+const SWP_FRAMECHANGED = 0x0020;
+const MONITOR_DEFAULTTONEAREST = 2;
+const DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+const DWMWCP_ROUND = 2;
+
+const ht_client = 1;
+const ht_caption = 2;
+const ht_left = 10;
+const ht_right = 11;
+const ht_top = 12;
+const ht_top_left = 13;
+const ht_top_right = 14;
+const ht_bottom = 15;
+const ht_bottom_left = 16;
+const ht_bottom_right = 17;
+
+/// The icon's resource, as assets/rembrandt.rc names it.
+const icon_resource: ?*const anyopaque = @ptrFromInt(1);
+const image_icon = 1;
+const sm_cxicon = 11;
+const sm_cxsmicon = 49;
+
+extern "user32" fn GetWindowLongPtrW(h: HWND, index: i32) callconv(.winapi) isize;
+extern "user32" fn SetWindowLongPtrW(h: HWND, index: i32, value: isize) callconv(.winapi) isize;
+extern "user32" fn CallWindowProcW(prev: WNDPROC, h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT;
+extern "user32" fn GetClientRect(h: HWND, r: *RECT) callconv(.winapi) i32;
+extern "user32" fn ScreenToClient(h: HWND, p: *POINT) callconv(.winapi) i32;
+extern "user32" fn SetWindowPos(h: HWND, after: ?HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) callconv(.winapi) i32;
+extern "user32" fn IsZoomed(h: HWND) callconv(.winapi) i32;
+extern "user32" fn GetDpiForWindow(h: HWND) callconv(.winapi) u32;
+extern "user32" fn GetSystemMetricsForDpi(index: i32, dpi: u32) callconv(.winapi) i32;
+extern "user32" fn LoadImageW(instance: ?*anyopaque, name: ?*const anyopaque, kind: u32, cx: i32, cy: i32, load: u32) callconv(.winapi) ?*anyopaque;
+extern "user32" fn SendMessageW(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT;
+extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "user32" fn MonitorFromWindow(h: HWND, flags: u32) callconv(.winapi) ?HWND;
+extern "user32" fn GetMonitorInfoW(m: HWND, info: *MONITORINFO) callconv(.winapi) i32;
+extern "dwmapi" fn DwmExtendFrameIntoClientArea(h: HWND, margins: *const MARGINS) callconv(.winapi) i32;
+extern "dwmapi" fn DwmSetWindowAttribute(h: HWND, attr: u32, value: *const anyopaque, size: u32) callconv(.winapi) i32;
+
+var prev_proc: WNDPROC = undefined;
+var installed = false;
+
+/// Removes the caption from the window `hwnd`, keeping the rest of its
+/// frame; the header takes the caption's place.
+pub fn install(hwnd: ?HWND) void {
+    const h = hwnd orelse return;
+    if (installed) return;
+    installed = true;
+    const margins: MARGINS = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 };
+    _ = DwmExtendFrameIntoClientArea(h, &margins);
+    var corners: u32 = DWMWCP_ROUND;
+    _ = DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, @sizeOf(u32));
+    const prev = SetWindowLongPtrW(h, GWLP_WNDPROC, @bitCast(@intFromPtr(&proc)));
+    if (prev == 0) return;
+    prev_proc = @ptrFromInt(@as(usize, @bitCast(prev)));
+    _ = SetWindowPos(h, null, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+    setIcon(h);
+}
+
+/// The window's icon in the taskbar, Alt-Tab and its corner: the exe's own.
+fn setIcon(h: HWND) void {
+    const instance = GetModuleHandleW(null) orelse return;
+    const dpi = GetDpiForWindow(h);
+    const big = GetSystemMetricsForDpi(sm_cxicon, dpi);
+    const small = GetSystemMetricsForDpi(sm_cxsmicon, dpi);
+    if (LoadImageW(instance, icon_resource, image_icon, big, big, 0)) |icon|
+        _ = SendMessageW(h, WM_SETICON, 1, @bitCast(@intFromPtr(icon)));
+    if (LoadImageW(instance, icon_resource, image_icon, small, small, 0)) |icon|
+        _ = SendMessageW(h, WM_SETICON, 0, @bitCast(@intFromPtr(icon)));
+}
+
+fn proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT {
+    switch (msg) {
+        WM_NCCALCSIZE => if (wp != 0) {
+            if (IsZoomed(h) != 0) {
+                var info: MONITORINFO = .{};
+                if (MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)) |monitor| {
+                    if (GetMonitorInfoW(monitor, &info) != 0)
+                        (@as(*NCCALCSIZE_PARAMS, @ptrFromInt(@as(usize, @bitCast(lp))))).rgrc[0] = info.work;
+                }
+            }
+            return 0;
+        },
+        WM_NCHITTEST => if (hitTest(h, lp)) |r| return r,
+        else => {},
+    }
+    return CallWindowProcW(prev_proc, h, msg, wp, lp);
+}
+
+fn hitTest(h: HWND, lp: LPARAM) ?LRESULT {
+    const bits: usize = @bitCast(lp);
+    var p: POINT = .{
+        .x = @as(i16, @bitCast(@as(u16, @truncate(bits)))),
+        .y = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16)))),
+    };
+    if (ScreenToClient(h, &p) == 0) return null;
+    var r: RECT = .{};
+    if (GetClientRect(h, &r) == 0) return null;
+    const s = scale(h);
+    const edge: i32 = @intFromFloat(@max(2, 6 * s));
+    const left = p.x < edge;
+    const right = p.x >= r.right - edge;
+    const top = p.y < edge;
+    const bottom = p.y >= r.bottom - edge;
+    if (top and left) return ht_top_left;
+    if (top and right) return ht_top_right;
+    if (bottom and left) return ht_bottom_left;
+    if (bottom and right) return ht_bottom_right;
+    if (left) return ht_left;
+    if (right) return ht_right;
+    if (top) return ht_top;
+    if (bottom) return ht_bottom;
+    const x = @as(f32, @floatFromInt(p.x)) / s;
+    const y = @as(f32, @floatFromInt(p.y)) / s;
+    if (y < theme.header_h and !overControl(x, y)) return ht_caption;
+    return null;
+}
+
+fn scale(h: HWND) f32 {
+    const dpi = GetDpiForWindow(h);
+    return if (dpi > 0) @as(f32, @floatFromInt(dpi)) / 96 else 1;
+}
+
+// Keep `std` referenced on targets where the externs are not used.
+comptime {
+    _ = std;
+}

@@ -1,0 +1,19 @@
+.{
+    .name = .rembrandt,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .nanoui = .{ .path = "../nanoui" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "assets/rembrandt.rc",
+        "assets/rembrandt.ico",
+        "assets/rembrandt.svg",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+    },
+    .fingerprint = 0x1b320c33093c0920,
+}
