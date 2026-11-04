@@ -153,10 +153,11 @@ A nine-second walkthrough of the actual interface:
 | Empty | Prompt ready |
 | :---: | :---: |
 | ![Rembrandt's empty composer](docs/media/rembrandt-empty.png) | ![Rembrandt with a prompt entered](docs/media/rembrandt-compose.png) |
-| **Result** | **Backend** |
-| ![Rembrandt's result view with a demo image](docs/media/rembrandt-result.png) | ![Rembrandt's Backend sheet](docs/media/rembrandt-backend.png) |
+| **Result and reference reuse** | **Backend** |
+| ![Rembrandt's result view with an image attached as a reference](docs/media/rembrandt-result.png) | ![Rembrandt's Backend sheet](docs/media/rembrandt-backend.png) |
 
-The result view is seeded with a demo image for the screenshots.
+The result view is seeded with a demo image. The walkthrough shows reusing
+that result as a reference for the next prompt.
 
 ## Troubleshooting
 
