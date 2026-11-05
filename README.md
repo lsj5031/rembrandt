@@ -35,9 +35,13 @@ until a service is configured.
    - landscape — `1536 × 1024`
    - square — `1024 × 1024`
    - portrait — `1024 × 1536`
-3. Press **Generate**. Rembrandt sends one request at a time and waits up to
+3. In **Backend**, the **Output** chip switches between PNG, animated GIF,
+   and SVG. GIFs also show frame count and frame delay chips. The **quality**
+   chip above the prompt cycles quality with one click, without opening
+   Backend.
+4. Press **Generate**. Rembrandt sends one request at a time and waits up to
    four minutes for the backend to answer.
-4. The result appears on the right. It is added to **Recent** for this
+5. The result appears on the right. It is added to **Recent** for this
    session.
 
 To guide the result with images, click **+ Reference** or the **+** tile and
@@ -61,7 +65,9 @@ Each generated image is saved as:
 Documents\Rembrandt\rembrandt-<timestamp>.png
 ```
 
-The PNG stays on disk after Rembrandt closes. The Recent list and the current
+The extension follows the output format: GIF results save as
+`rembrandt-<timestamp>.gif`, SVG results as `rembrandt-<timestamp>.svg`. The
+file stays on disk after Rembrandt closes. The Recent list and the current
 preview are per session, so they start empty the next time you launch the app.
 
 ## Work with a result
@@ -71,7 +77,9 @@ Below the preview you can:
 - **Use as reference** — attach a copy of this result to the next prompt.
 - **Copy path** — copy the full PNG path to the clipboard.
 - **Open** — open the PNG in your default image viewer.
-- Click a **Recent** row to show that image in the preview again.
+- Click a **Recent** row to show that image in the preview again. GIF
+  results loop in the preview; SVG results are drawn when readable. Both
+  still offer **Copy path** and **Open** if the preview cannot render them.
 
 The preview also shows the image dimensions, file size, generation time, and
 token count.
@@ -87,13 +95,18 @@ Then edit:
 
 - **Base URL** — the address of your OpenAI-compatible image service.
 - **Model** — optional; leave it blank to use the service's default model.
+- **Quality** and **Complexity** — request controls added by Images 2.6.
+  `auto` leaves each to the service; click a chip to cycle through `low`,
+  `medium`, and `high`.
+- **Output** — `png` (default), `gif`, or `svg`. GIFs also expose **frames**
+  (4, 6, 9, 12, or 16) and **frame delay** (100 to 500 ms presets).
 - **API key** — the token your service expects, if any.
 
 Press **Save** to apply the settings. Press **Cancel**, click outside the
 panel, or press Escape to dismiss it.
 
-The base URL, model, and size are remembered for next time. The API key is
-kept in memory only; it is never written to disk and must be entered again
+The base URL, model, size, quality, complexity, output format, frame count,
+and frame delay are remembered for next time. The API key is kept in memory only; it is never written to disk and must be entered again
 after restarting the app.
 
 ## Connect a backend
@@ -104,7 +117,7 @@ Your backend must:
 - for reference images, accept `POST <base URL>/images/edits` with JSON
   `images: [{"image_url":"data:image/png;base64,..."}]` (PNG, JPEG, or WebP;
   up to 16 images);
-- return an OpenAI-compatible response containing a PNG in
+- return an OpenAI-compatible response containing a PNG, GIF, or SVG in
   `data[0].b64_json`.
 
 The defaults are:
@@ -114,6 +127,11 @@ The defaults are:
 | Base URL | `http://127.0.0.1:3425/v1` |
 | Model | server default |
 | Size | `1536x1024` |
+| Quality | `auto` |
+| Complexity | `auto` |
+| Output | `png` |
+| GIF frames | `9` |
+| GIF frame delay | `200` ms |
 
 You can set the connection before launching with environment variables.
 In PowerShell:
@@ -140,6 +158,11 @@ export REMBRANDT_MODEL="your-model"
 | `REMBRANDT_API_KEY` | Bearer token sent to the service. |
 | `REMBRANDT_MODEL` | Model name; leave empty for the server default. |
 | `REMBRANDT_SIZE` | `1536x1024`, `1024x1024`, or `1024x1536`. |
+| `REMBRANDT_QUALITY` | `auto`, `low`, `medium`, or `high`. |
+| `REMBRANDT_COMPLEXITY` | `auto`, `low`, `medium`, or `high`. |
+| `REMBRANDT_FORMAT` | `png`, `gif`, or `svg`. |
+| `REMBRANDT_FRAMES` | GIF frame count, `2` to `16`. |
+| `REMBRANDT_FRAME_MS` | GIF frame delay in milliseconds, `20` to `60000`. |
 | `REMBRANDT_REFERENCES` | Reference file paths to preload; separated by `;` on Windows or `:` on macOS/Linux. |
 
 ## Screenshots and walkthrough
@@ -311,7 +334,10 @@ src/win_frame.zig    Windows caption removal, drag regions, window icon
 src/backend.zig      endpoint config, request/response, PNG helpers
 src/generation.zig   submission and saving the generated result
 src/references.zig   owned reference bytes, limits, and drop paths
-src/settings_store.zig persisted base URL/model/size (never the key)
+src/settings_store.zig persisted base URL/model/size/quality/format/frames
+src/gif.zig          GIF frame compositing into preview PNGs
+src/playback.zig     the selected GIF's frame clock and preview
+src/tests_formats.zig GIF/SVG requests, decoding, saving and controls
 src/log.zig          synchronous run log
 src/theme.zig        paper/pine palette
 src/mark.svg         header and empty-state mark

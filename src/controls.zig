@@ -3,6 +3,7 @@ const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const motion = ui.motion;
 const theme = @import("theme.zig");
+const backend = @import("backend.zig");
 
 pub const Caption = enum { minimize, maximize, close };
 
@@ -83,6 +84,48 @@ pub fn smallLabel(c: *ui.Context, text: []const u8) void {
 
 pub fn settingsLabel(c: *ui.Context, text: []const u8) void {
     ui.text(c, text, .{ .size = 10, .weight = .medium, .color = theme.stone });
+}
+
+/// The Backend sheet's request knobs: output format, quality, complexity and,
+/// for GIFs, the frame count and delay. Edits stay in `options` until Save.
+/// Returns whether anything changed.
+pub fn requestControls(c: *ui.Context, options: *backend.RequestOptions) bool {
+    var changed = false;
+    settingsLabel(c, "REQUEST");
+    const formats = ui.div(c).row().wFull().gap(6).itemsCenter();
+    if (chip(c, c.print("output: {s}", .{options.format.api()}), true)) {
+        options.format = options.format.cycle();
+        changed = true;
+    }
+    if (chip(c, c.print("quality: {s}", .{options.quality.api()}), true)) {
+        options.quality = options.quality.cycle();
+        changed = true;
+    }
+    formats.end();
+    const knobs = ui.div(c).row().wFull().gap(6).itemsCenter();
+    if (chip(c, c.print("complexity: {s}", .{options.complexity.api()}), true)) {
+        options.complexity = options.complexity.cycle();
+        changed = true;
+    }
+    knobs.end();
+    if (options.format == .gif) {
+        const gif_knobs = ui.div(c).row().wFull().gap(6).itemsCenter();
+        if (chip(c, c.print("frames: {d}", .{options.frames}), true)) {
+            options.frames = backend.nextFrames(options.frames);
+            changed = true;
+        }
+        if (chip(c, c.print("{d} ms/frame", .{options.frame_ms}), true)) {
+            options.frame_ms = backend.nextFrameMs(options.frame_ms);
+            changed = true;
+        }
+        gif_knobs.end();
+    }
+    ui.text(c, switch (options.format) {
+        .gif => "GIFs loop in the preview and save as .gif.",
+        .svg => "SVG saves a vector file.",
+        .png => "Auto leaves each setting to the server.",
+    }, .{ .size = 10, .color = theme.stone });
+    return changed;
 }
 
 pub fn chip(c: *ui.Context, label: []const u8, chevron: bool) bool {

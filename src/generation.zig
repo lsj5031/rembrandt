@@ -39,11 +39,13 @@ pub fn generate(s: *State) void {
         headers[hn] = .{ .name = "Authorization", .value = auth.? };
         hn += 1;
     }
-    log.info("generate: model={s} refs={d} ({d:.1} MiB) size={s} prompt_chars={d}", .{
+    log.info("generate: model={s} refs={d} ({d:.1} MiB) size={s} quality={s} complexity={s} prompt_chars={d}", .{
         if (s.config.model.len == 0) "server default" else s.config.model,
         refs.len,
         @as(f64, @floatFromInt(s.refs.total)) / (1024 * 1024),
         s.config.size.api(),
+        s.config.quality.api(),
+        s.config.complexity.api(),
         prompt.len,
     });
     s.clearError();
@@ -75,12 +77,16 @@ fn onGenerated(s: *State, r: nanoui.http.Response) void {
         s.setError("The backend sent no image.");
         return;
     };
-    const image = backend.decodePng(s.gpa, parsed.b64) catch {
-        s.setError("Could not decode the image.");
+    const image = backend.decodeInline(s.gpa, parsed.b64) catch |e| {
+        s.setError(switch (e) {
+            error.NotAnImage => "The backend sent an unsupported image.",
+            error.TooLarge => "That image is too large to open.",
+            else => "Could not decode the image.",
+        });
         return;
     };
     const stamp = std.Io.Clock.real.now(s.io).toSeconds();
-    const name = std.fmt.allocPrint(s.gpa, "rembrandt-{d}.png", .{stamp}) catch {
+    const name = backend.fileName(s.gpa, stamp, image.kind) catch {
         s.gpa.free(image.bytes);
         s.setError("Out of memory.");
         return;
@@ -92,7 +98,7 @@ fn onGenerated(s: *State, r: nanoui.http.Response) void {
         return;
     };
     const secs = ui.clock.now() - s.started_at;
-    log.info("generated: {d}x{d}, {d} tokens, {d:.1}s, saved to {s}", .{ image.width, image.height, parsed.tokens, secs, path });
+    log.info("generated: {s} {d}x{d}, {d} tokens, {d:.1}s, saved to {s}", .{ image.kind.label(), image.width, image.height, parsed.tokens, secs, path });
     s.addItem(.{
         .bytes = image.bytes,
         .name = name,
@@ -101,11 +107,12 @@ fn onGenerated(s: *State, r: nanoui.http.Response) void {
         .height = image.height,
         .tokens = parsed.tokens,
         .secs = secs,
+        .kind = image.kind,
     });
     s.clearError();
 }
 
-fn saveImage(s: *State, name: []const u8, bytes: []const u8) ![]u8 {
+pub fn saveImage(s: *State, name: []const u8, bytes: []const u8) ![]u8 {
     const directory = if (s.output_dir) |dir| try s.gpa.dupe(u8, dir) else blk: {
         const documents = try nanoui.path(s.gpa, .documents, "Rembrandt");
         defer s.gpa.free(documents);

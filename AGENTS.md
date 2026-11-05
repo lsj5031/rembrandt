@@ -25,7 +25,9 @@ Rembrandt posts to an OpenAI-compatible `POST /v1/images/generations`, or
 `POST /v1/images/edits` with JSON data URLs when reference images are attached,
 and reads `data[0].b64_json`. Any compatible service works. The in-app Backend
 sheet changes the base URL, model and API key; environment values are the
-defaults:
+defaults. Its Quality and Complexity chips set the Images 2.6 `quality` and
+`complexity` request fields; both are omitted while `auto`, so older or local
+backends receive exactly the request they did before.
 
 | Variable | Default |
 | --- | --- |
@@ -33,10 +35,16 @@ defaults:
 | `REMBRANDT_API_KEY` | empty (no Authorization header) |
 | `REMBRANDT_MODEL` | empty (server default) |
 | `REMBRANDT_SIZE` | `1536x1024` |
+| `REMBRANDT_QUALITY` | `auto`; `low`, `medium` or `high` is sent as `quality` |
+| `REMBRANDT_COMPLEXITY` | `auto`; `low`, `medium` or `high` is sent as `complexity` |
+| `REMBRANDT_FORMAT` | `png` (default), `gif` or `svg`; sent as `output_format` |
+| `REMBRANDT_FRAMES` | `2`-`16`; sent as `frame_count` for GIFs |
+| `REMBRANDT_FRAME_MS` | `20`-`60000`; sent as `frame_duration_ms` for GIFs |
 | `REMBRANDT_REFERENCES` | empty; preload paths separated by `;` on Windows or `:` on macOS/Linux |
 
-Base URL, model and size persist in `%APPDATA%\Rembrandt\settings.json` (or
-the platform's app-data directory); the API key is memory-only. Results go to
+Base URL, model, size, quality, complexity and the output format (with GIF
+frame count and delay) persist in `%APPDATA%\Rembrandt\settings.json` (or the
+platform's app-data directory); the API key is memory-only. Results go to
 `Documents/Rembrandt/rembrandt-<timestamp>.png`.
 
 `REMBRANDT_PROMPT` prefills the composer, and `REMBRANDT_DEMO_IMAGE` preloads
@@ -81,6 +89,9 @@ by `assets/rembrandt.rc`.
   `t.typeText`, `t.hasText`, `t.screenshot("/tmp/x.png")`.
 - Actual Generate tests in `src/tests_generation.zig` use an ephemeral
   loopback server and temporary saves; they never call the real backend.
+- GIF and SVG results save as `.gif`/`.svg`. A GIF preview is decoded once
+  per selected result into PNG frames (`src/gif.zig`); an unreadable GIF or
+  SVG shows a fallback in the preview and still offers Open and Copy path.
 - Reference removal/Clear is deferred until the next view, before drawing:
   `ui.image` retains the previous view's source bytes until painting finishes.
   Guard PNG thumbnail dimensions before calling it; a small display size does
@@ -102,7 +113,10 @@ src/main.zig         the window and frame
 src/app.zig          the state and its view
 src/controls.zig     shared buttons, chips, and press feedback
 src/win_frame.zig    Windows caption removal, drag hit testing, icon
-src/settings_store.zig persisted base URL/model/size (never the key)
+src/settings_store.zig persisted base URL/model/size/quality/format/frames
+src/gif.zig          GIF frame compositing into preview PNGs
+src/playback.zig     the selected GIF's frame clock and preview
+src/tests_formats.zig GIF/SVG requests, decoding, saving and controls
 src/log.zig          synchronous file log for the running app
 src/backend.zig      OpenAI-compatible config, JSON and PNG decoding
 src/generation.zig   request submission, callback and saving

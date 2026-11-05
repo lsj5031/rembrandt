@@ -1,5 +1,6 @@
-//! The persisted half of Backend settings: base URL, model and size. The API
-//! key is deliberately absent — it stays in memory only.
+//! The persisted half of Backend settings: base URL, model, size, quality,
+//! complexity and the output format. The API key is deliberately absent — it
+//! stays in memory only.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const backend = @import("backend.zig");
@@ -27,7 +28,7 @@ pub fn encode(gpa: std.mem.Allocator, config: *const backend.Config) ![]u8 {
     defer gpa.free(base);
     const model = try backend.escapeJson(gpa, config.model);
     defer gpa.free(model);
-    return std.fmt.allocPrint(gpa, "{{\"base_url\":\"{s}\",\"model\":\"{s}\",\"size\":\"{s}\"}}", .{ base, model, config.size.api() });
+    return std.fmt.allocPrint(gpa, "{{\"base_url\":\"{s}\",\"model\":\"{s}\",\"size\":\"{s}\",\"quality\":\"{s}\",\"complexity\":\"{s}\",\"format\":\"{s}\",\"frames\":{d},\"frame_ms\":{d}}}", .{ base, model, config.size.api(), config.quality.api(), config.complexity.api(), config.format.api(), config.frames, config.frame_ms });
 }
 
 pub fn apply(gpa: std.mem.Allocator, config: *backend.Config, bytes: []const u8) !void {
@@ -47,6 +48,36 @@ pub fn apply(gpa: std.mem.Allocator, config: *backend.Config, bytes: []const u8)
             if (obj.get("size")) |v| switch (v) {
                 .string => |str| {
                     if (backend.Size.parse(str)) |size| config.size = size;
+                },
+                else => {},
+            };
+            if (obj.get("quality")) |v| switch (v) {
+                .string => |str| {
+                    if (backend.Level.parse(str)) |level| config.quality = level;
+                },
+                else => {},
+            };
+            if (obj.get("complexity")) |v| switch (v) {
+                .string => |str| {
+                    if (backend.Level.parse(str)) |level| config.complexity = level;
+                },
+                else => {},
+            };
+            if (obj.get("format")) |v| switch (v) {
+                .string => |str| {
+                    if (backend.Format.parse(str)) |format| config.format = format;
+                },
+                else => {},
+            };
+            if (obj.get("frames")) |v| switch (v) {
+                .integer => |n| {
+                    if (n >= 2 and n <= 16) config.frames = @intCast(n);
+                },
+                else => {},
+            };
+            if (obj.get("frame_ms")) |v| switch (v) {
+                .integer => |n| {
+                    if (n >= 20 and n <= 60_000) config.frame_ms = @intCast(n);
                 },
                 else => {},
             };

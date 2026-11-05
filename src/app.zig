@@ -12,6 +12,7 @@ const settings_store = @import("settings_store.zig");
 const theme = @import("theme.zig");
 const controls = @import("controls.zig");
 const references = @import("references.zig");
+const gif_playback = @import("playback.zig");
 const Caption = controls.Caption;
 const captionButton = controls.captionButton;
 const primaryButton = controls.primaryButton;
@@ -26,11 +27,14 @@ pub const State = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     config: backend.Config,
+    /// The Backend sheet's request knobs; copied into `config` by Save only.
+    request_draft: backend.RequestOptions = .{},
     /// `%APPDATA%\Rembrandt\settings.json`; null when there is no data dir.
     config_path: ?[]u8 = null,
     prompt: ui.TextBuffer = .{},
     refs: references.List = .{},
     ref_action: controls.RefAction = .none,
+    playback: gif_playback.Playback = .{},
     /// Caller-owned override for isolated generation checks; null uses Documents.
     output_dir: ?[]const u8 = null,
 
@@ -60,7 +64,7 @@ pub const State = struct {
         };
         s.config_path = settings_store.path(gpa) catch null;
         if (s.config_path) |path| settings_store.load(gpa, io, path, &s.config) catch {};
-        log.info("settings: base={s} model={s} size={s}", .{ s.config.base_url, s.config.model, s.config.size.api() });
+        log.info("settings: base={s} model={s} size={s} quality={s} complexity={s} format={s} frames={d} frame_ms={d}", .{ s.config.base_url, s.config.model, s.config.size.api(), s.config.quality.api(), s.config.complexity.api(), s.config.format.api(), s.config.frames, s.config.frame_ms });
         if (env.get("REMBRANDT_PROMPT")) |p| s.prompt.set(p);
         s.loadDemo(env) catch {};
         s.refs.loadEnv(gpa, io, env);
@@ -84,6 +88,7 @@ pub const State = struct {
         }
         s.config.deinit(s.gpa);
         s.refs.deinit(s.gpa);
+        s.playback.deinit(s.gpa);
         if (s.config_path) |p| s.gpa.free(p);
         s.prompt.deinit();
         s.url_buf.deinit();
@@ -97,6 +102,8 @@ pub const State = struct {
         s.referenceAction(action, c);
         c.theme = theme.paper;
         c.title_bar_height = theme.header_h;
+        const selected: ?*const backend.Item = if (s.count > 0) &s.history[s.selected] else null;
+        s.playback.sync(s.gpa, selected, ui.clock.now());
         if (s.generating) {
             s.elapsed = ui.clock.now() - s.started_at;
             c.animationFrame();
@@ -169,7 +176,11 @@ pub const State = struct {
             c.changed = true;
         };
 
+        const prompt_head = ui.div(c).row().wFull().itemsCenter();
         smallLabel(c, "PROMPT");
+        ui.spacer(c);
+        if (chip(c, c.print("quality · {s}", .{s.config.quality.api()}), true)) s.cycleQuality();
+        prompt_head.end();
         const result = ui.textArea(c, &s.prompt, .{
             .placeholder = "Describe an image…",
             .size = 24,
@@ -226,7 +237,13 @@ pub const State = struct {
         }
 
         const thumb = ui.div(c).w(40).h(40).rounded(6).bg(theme.thumb).clip().itemsCenter().justifyCenter();
-        _ = ui.image(c, .{ .key = it.name, .bytes = it.bytes, .max_width = 40, .max_height = 40, .radius = 6, .scale = 1 });
+        switch (it.kind) {
+            .png => _ = ui.image(c, .{ .key = it.name, .bytes = it.bytes, .max_width = 40, .max_height = 40, .radius = 6, .scale = 1 }),
+            .gif => ui.text(c, "GIF", .{ .size = 9, .color = theme.stone }),
+            .svg => {
+                if (!ui.svg(c, .{ .key = it.name, .bytes = it.bytes, .size = 40 })) ui.text(c, "SVG", .{ .size = 9, .color = theme.stone });
+            },
+        }
         thumb.end();
 
         const meta = ui.div(c).column().gap(1).justifyCenter();
@@ -279,7 +296,19 @@ pub const State = struct {
                 });
             const wrap = ui.div(c).sizeFull().itemsCenter().justifyCenter().motion(reveal);
             defer wrap.end();
-            _ = ui.image(c, .{ .key = it.name, .bytes = it.bytes, .max_width = 700, .max_height = 467, .radius = 12, .scale = 1 });
+            switch (it.kind) {
+                .png => _ = ui.image(c, .{ .key = it.name, .bytes = it.bytes, .max_width = 700, .max_height = 467, .radius = 12, .scale = 1 }),
+                .gif => if (!s.playback.draw(c, it)) {
+                    ui.text(c, "GIF preview unavailable", .{ .size = 13, .color = theme.stone });
+                    ui.text(c, "The file is saved; Open plays it.", .{ .size = 11, .color = theme.stone });
+                },
+                .svg => {
+                    if (it.bytes.len > 4 * 1024 * 1024 or !ui.svg(c, .{ .key = it.name, .bytes = it.bytes, .width = 700, .height = 467 })) {
+                        ui.text(c, "SVG preview unavailable", .{ .size = 13, .color = theme.stone });
+                        ui.text(c, "The file is saved; Open shows it.", .{ .size = 11, .color = theme.stone });
+                    }
+                },
+            }
         } else {
             _ = ui.svg(c, .{ .key = "rembrandt.empty", .bytes = theme.mark_svg, .size = 58 });
             ui.text(c, "Your image will appear here", .{ .size = 13, .color = theme.stone });
@@ -294,7 +323,11 @@ pub const State = struct {
             const info = ui.div(c).column().gap(2);
             ui.text(c, it.name, .{ .size = 13, .weight = .medium, .color = theme.ink });
             const mb = @as(f64, @floatFromInt(it.bytes.len)) / (1024.0 * 1024.0);
-            ui.text(c, c.print("{d} × {d} · {d:.2} MB", .{ it.width, it.height, mb }), .{ .size = 11, .color = theme.stone });
+            if (it.width > 0) {
+                ui.text(c, c.print("{d} × {d} · {d:.2} MB", .{ it.width, it.height, mb }), .{ .size = 11, .color = theme.stone });
+            } else {
+                ui.text(c, c.print("{s} · {d:.2} MB", .{ it.kind.label(), mb }), .{ .size = 11, .color = theme.stone });
+            }
             info.end();
 
             ui.spacer(c);
@@ -378,6 +411,7 @@ pub const State = struct {
         _ = ui.textField(c, &s.url_buf, .{ .placeholder = "http://127.0.0.1:3425/v1", .width = .fill, .size = 13 });
         settingsLabel(c, "MODEL");
         _ = ui.textField(c, &s.model_buf, .{ .placeholder = "your-model", .width = .fill, .size = 13 });
+        if (controls.requestControls(c, &s.request_draft)) c.changed = true;
         settingsLabel(c, "API KEY");
         _ = ui.textField(c, &s.key_buf, .{ .placeholder = "Optional API key", .width = .fill, .size = 13, .password = true });
         ui.text(c, "The key stays in memory; the rest is kept.", .{ .size = 10, .color = theme.stone });
@@ -418,19 +452,36 @@ pub const State = struct {
         s.url_buf.set(s.config.base_url);
         s.model_buf.set(s.config.model);
         s.key_buf.set(s.config.api_key);
+        s.request_draft = .{
+            .quality = s.config.quality,
+            .complexity = s.config.complexity,
+            .format = s.config.format,
+            .frames = s.config.frames,
+            .frame_ms = s.config.frame_ms,
+        };
     }
 
     fn saveSettings(s: *State) void {
         s.config.setBase(s.gpa, s.url_buf.text()) catch {};
         s.config.setModel(s.gpa, s.model_buf.text()) catch {};
         s.config.setKey(s.gpa, s.key_buf.text()) catch {};
+        s.config.quality = s.request_draft.quality;
+        s.config.complexity = s.request_draft.complexity;
+        s.config.format = s.request_draft.format;
+        s.config.frames = s.request_draft.frames;
+        s.config.frame_ms = s.request_draft.frame_ms;
         if (s.config_path) |path| settings_store.save(s.gpa, s.io, path, &s.config) catch |e| log.warn("settings save failed: {t}", .{e});
-        log.info("settings applied: base={s} model={s} size={s}", .{ s.config.base_url, s.config.model, s.config.size.api() });
+        log.info("settings applied: base={s} model={s} size={s} quality={s} complexity={s} format={s} frames={d} frame_ms={d}", .{ s.config.base_url, s.config.model, s.config.size.api(), s.config.quality.api(), s.config.complexity.api(), s.config.format.api(), s.config.frames, s.config.frame_ms });
         s.show_settings = false;
     }
 
     pub fn cycleSize(s: *State) void {
         s.config.size = s.config.size.cycle();
+        if (s.config_path) |path| settings_store.save(s.gpa, s.io, path, &s.config) catch {};
+    }
+
+    pub fn cycleQuality(s: *State) void {
+        s.config.quality = s.config.quality.cycle();
         if (s.config_path) |path| settings_store.save(s.gpa, s.io, path, &s.config) catch {};
     }
 

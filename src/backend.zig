@@ -1,5 +1,5 @@
 //! The OpenAI-compatible image backend Rembrandt talks to. It answers
-//! generations or reference-image edits with a b64_json PNG.
+//! generations or reference-image edits with a b64_json image: PNG, GIF or SVG.
 const std = @import("std");
 const references = @import("references.zig");
 
@@ -43,11 +43,126 @@ pub const Size = enum {
     }
 };
 
+/// A per-request Images 2.6 control. `auto` is the server's own default and
+/// is left out of the body, so a backend that predates the field sees the
+/// same request it always did.
+pub const Level = enum {
+    auto,
+    low,
+    medium,
+    high,
+
+    pub fn api(self: Level) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+        };
+    }
+
+    pub fn cycle(self: Level) Level {
+        return switch (self) {
+            .auto => .low,
+            .low => .medium,
+            .medium => .high,
+            .high => .auto,
+        };
+    }
+
+    pub fn parse(s: []const u8) ?Level {
+        if (std.mem.eql(u8, s, "auto")) return .auto;
+        if (std.mem.eql(u8, s, "low")) return .low;
+        if (std.mem.eql(u8, s, "medium")) return .medium;
+        if (std.mem.eql(u8, s, "high")) return .high;
+        return null;
+    }
+};
+
+/// The response formats the API can return: PNG by default, an animated
+/// GIF, or an SVG document.
+pub const Format = enum {
+    png,
+    gif,
+    svg,
+
+    pub fn api(self: Format) []const u8 {
+        return switch (self) {
+            .png => "png",
+            .gif => "gif",
+            .svg => "svg",
+        };
+    }
+
+    pub fn label(self: Format) []const u8 {
+        return switch (self) {
+            .png => "PNG",
+            .gif => "GIF",
+            .svg => "SVG",
+        };
+    }
+
+    pub fn cycle(self: Format) Format {
+        return switch (self) {
+            .png => .gif,
+            .gif => .svg,
+            .svg => .png,
+        };
+    }
+
+    pub fn parse(s: []const u8) ?Format {
+        if (std.ascii.eqlIgnoreCase(s, "png")) return .png;
+        if (std.ascii.eqlIgnoreCase(s, "gif")) return .gif;
+        if (std.ascii.eqlIgnoreCase(s, "svg")) return .svg;
+        return null;
+    }
+};
+
+/// The frames chip's presets; the API accepts 2 through 16.
+pub fn nextFrames(n: u8) u8 {
+    for ([_]u8{ 4, 6, 9, 12, 16 }) |candidate| {
+        if (candidate > n) return candidate;
+    }
+    return 4;
+}
+
+pub fn nextFrameMs(ms: u16) u16 {
+    for ([_]u16{ 100, 150, 200, 300, 500 }) |candidate| {
+        if (candidate > ms) return candidate;
+    }
+    return 100;
+}
+
+fn parseFrames(raw: []const u8) ?u8 {
+    const n = std.fmt.parseInt(u8, raw, 10) catch return null;
+    return if (n >= 2 and n <= 16) n else null;
+}
+
+fn parseFrameMs(raw: []const u8) ?u16 {
+    const n = std.fmt.parseInt(u16, raw, 10) catch return null;
+    return if (n >= 20 and n <= 60_000) n else null;
+}
+
+/// The Backend sheet's per-request knobs. The view edits these in a draft
+/// and copies them into `Config` only when Save is pressed.
+pub const RequestOptions = struct {
+    quality: Level = .auto,
+    complexity: Level = .auto,
+    format: Format = .png,
+    frames: u8 = 9,
+    frame_ms: u16 = 200,
+};
+
 pub const Config = struct {
     base_url: []u8,
     api_key: []u8,
     model: []u8,
     size: Size = .landscape,
+    quality: Level = .auto,
+    complexity: Level = .auto,
+    format: Format = .png,
+    frames: u8 = 9,
+    frame_ms: u16 = 200,
     n: u8 = 1,
 
     pub fn init(gpa: std.mem.Allocator, env: anytype) !Config {
@@ -62,6 +177,11 @@ pub const Config = struct {
             .api_key = key,
             .model = model,
             .size = Size.parse(env.get("REMBRANDT_SIZE") orelse "") orelse .landscape,
+            .quality = Level.parse(env.get("REMBRANDT_QUALITY") orelse "") orelse .auto,
+            .complexity = Level.parse(env.get("REMBRANDT_COMPLEXITY") orelse "") orelse .auto,
+            .format = Format.parse(env.get("REMBRANDT_FORMAT") orelse "") orelse .png,
+            .frames = parseFrames(env.get("REMBRANDT_FRAMES") orelse "") orelse 9,
+            .frame_ms = parseFrameMs(env.get("REMBRANDT_FRAME_MS") orelse "") orelse 200,
         };
     }
 
@@ -133,6 +253,7 @@ pub const Item = struct {
     height: u32,
     tokens: u64,
     secs: f64,
+    kind: Format = .png,
     demo: bool = false,
 };
 
@@ -140,6 +261,7 @@ pub const Image = struct {
     bytes: []u8,
     width: u32,
     height: u32,
+    kind: Format = .png,
 };
 
 pub const PixelSize = struct { width: u32, height: u32 };
@@ -165,12 +287,47 @@ pub fn normalize(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
 pub fn buildBody(gpa: std.mem.Allocator, cfg: *const Config, prompt: []const u8) ![]u8 {
     const p = try escapeJson(gpa, prompt);
     defer gpa.free(p);
-    if (cfg.model.len == 0) {
-        return std.fmt.allocPrint(gpa, "{{\"prompt\":\"{s}\",\"n\":{d},\"size\":\"{s}\"}}", .{ p, cfg.n, cfg.size.api() });
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '{');
+    if (cfg.model.len > 0) {
+        const m = try escapeJson(gpa, cfg.model);
+        defer gpa.free(m);
+        try out.appendSlice(gpa, "\"model\":\"");
+        try out.appendSlice(gpa, m);
+        try out.appendSlice(gpa, "\",");
     }
-    const m = try escapeJson(gpa, cfg.model);
-    defer gpa.free(m);
-    return std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"prompt\":\"{s}\",\"n\":{d},\"size\":\"{s}\"}}", .{ m, p, cfg.n, cfg.size.api() });
+    try out.appendSlice(gpa, "\"prompt\":\"");
+    try out.appendSlice(gpa, p);
+    var n_buf: [8]u8 = undefined;
+    const n_text = try std.fmt.bufPrint(&n_buf, "{d}", .{cfg.n});
+    try out.appendSlice(gpa, "\",\"n\":");
+    try out.appendSlice(gpa, n_text);
+    try out.appendSlice(gpa, ",\"size\":\"");
+    try out.appendSlice(gpa, cfg.size.api());
+    try out.append(gpa, '"');
+    try appendLevel(&out, gpa, "quality", cfg.quality);
+    try appendLevel(&out, gpa, "complexity", cfg.complexity);
+    switch (cfg.format) {
+        .png => {},
+        .svg => try out.appendSlice(gpa, ",\"output_format\":\"svg\""),
+        .gif => {
+            var tail_buf: [96]u8 = undefined;
+            const tail = try std.fmt.bufPrint(&tail_buf, ",\"output_format\":\"gif\",\"frame_count\":{d},\"frame_duration_ms\":{d}", .{ cfg.frames, cfg.frame_ms });
+            try out.appendSlice(gpa, tail);
+        },
+    }
+    try out.append(gpa, '}');
+    return out.toOwnedSlice(gpa);
+}
+
+fn appendLevel(out: *std.ArrayList(u8), gpa: std.mem.Allocator, name: []const u8, level: Level) !void {
+    if (level == .auto) return;
+    try out.appendSlice(gpa, ",\"");
+    try out.appendSlice(gpa, name);
+    try out.appendSlice(gpa, "\":\"");
+    try out.appendSlice(gpa, level.api());
+    try out.append(gpa, '"');
 }
 
 pub const RefInput = struct { bytes: []const u8, mime: []const u8 };
@@ -262,6 +419,112 @@ pub fn pngSize(bytes: []const u8) ?PixelSize {
         .width = std.mem.readInt(u32, bytes[16..20], .big),
         .height = std.mem.readInt(u32, bytes[20..24], .big),
     };
+}
+
+pub fn gifSize(bytes: []const u8) ?PixelSize {
+    if (bytes.len < 10) return null;
+    if (!std.mem.eql(u8, bytes[0..6], "GIF87a") and !std.mem.eql(u8, bytes[0..6], "GIF89a")) return null;
+    return .{
+        .width = std.mem.readInt(u16, bytes[6..8], .little),
+        .height = std.mem.readInt(u16, bytes[8..10], .little),
+    };
+}
+
+/// The width and height in an SVG's opening tag, else its viewBox.
+pub fn svgSize(bytes: []const u8) ?PixelSize {
+    const start = std.mem.indexOf(u8, bytes[0..@min(bytes.len, 4096)], "<svg") orelse return null;
+    const close = std.mem.indexOfScalar(u8, bytes[start..], '>') orelse return null;
+    const tag = bytes[start .. start + close];
+    if (attrNumber(tag, "width")) |w| {
+        if (attrNumber(tag, "height")) |h| return .{ .width = pixelCount(w), .height = pixelCount(h) };
+    }
+    if (attrValue(tag, "viewBox")) |view| {
+        var parts = std.mem.tokenizeAny(u8, view, " ,\t\r\n");
+        _ = parts.next() orelse return null;
+        _ = parts.next() orelse return null;
+        const w = std.fmt.parseFloat(f32, parts.next() orelse return null) catch return null;
+        const h = std.fmt.parseFloat(f32, parts.next() orelse return null) catch return null;
+        if (w <= 0 or h <= 0) return null;
+        return .{ .width = pixelCount(w), .height = pixelCount(h) };
+    }
+    return null;
+}
+
+fn attrValue(tag: []const u8, name: []const u8) ?[]const u8 {
+    var at: usize = 0;
+    while (at < tag.len) {
+        const rel = std.mem.indexOf(u8, tag[at..], name) orelse return null;
+        const i = at + rel;
+        at = i + name.len;
+        if (i > 0) {
+            const before = tag[i - 1];
+            if (std.ascii.isAlphanumeric(before) or before == '-' or before == ':' or before == '_') continue;
+        }
+        var j = i + name.len;
+        while (j < tag.len and (tag[j] == ' ' or tag[j] == '\t')) j += 1;
+        if (j >= tag.len or tag[j] != '=') continue;
+        j += 1;
+        while (j < tag.len and (tag[j] == ' ' or tag[j] == '\t')) j += 1;
+        if (j >= tag.len or (tag[j] != '"' and tag[j] != '\'')) continue;
+        const quote = tag[j];
+        const close = std.mem.indexOfScalar(u8, tag[j + 1 ..], quote) orelse return null;
+        return tag[j + 1 .. j + 1 + close];
+    }
+    return null;
+}
+
+fn attrNumber(tag: []const u8, name: []const u8) ?f32 {
+    const raw = attrValue(tag, name) orelse return null;
+    var end: usize = 0;
+    while (end < raw.len) : (end += 1) {
+        const ch = raw[end];
+        if (!(std.ascii.isDigit(ch) or ch == '.' or ch == '-' or ch == '+' or ch == 'e' or ch == 'E')) break;
+    }
+    if (end == 0) return null;
+    const value = std.fmt.parseFloat(f32, raw[0..end]) catch return null;
+    return if (value > 0) value else null;
+}
+
+fn pixelCount(value: f32) u32 {
+    return @intFromFloat(@min(@round(value), 100_000));
+}
+
+/// What the backend actually returned: the request's format is a hint, not
+/// a guarantee.
+pub fn sniffFormat(bytes: []const u8) ?Format {
+    if (bytes.len >= 8 and std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return .png;
+    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return .gif;
+    if (std.mem.indexOf(u8, bytes[0..@min(bytes.len, 4096)], "<svg") != null) return .svg;
+    return null;
+}
+
+pub fn formatSize(format: Format, bytes: []const u8) ?PixelSize {
+    return switch (format) {
+        .png => pngSize(bytes),
+        .gif => gifSize(bytes),
+        .svg => svgSize(bytes),
+    };
+}
+
+pub fn decodeInline(gpa: std.mem.Allocator, b64: []const u8) !Image {
+    const decoder = std.base64.standard.Decoder;
+    const n = decoder.calcSizeForSlice(b64) catch return error.BadBase64;
+    if (n > 64 << 20) return error.TooLarge;
+    const bytes = try gpa.alloc(u8, n);
+    errdefer gpa.free(bytes);
+    decoder.decode(bytes, b64) catch return error.BadBase64;
+    const kind = sniffFormat(bytes) orelse return error.NotAnImage;
+    const dims = formatSize(kind, bytes);
+    return .{
+        .bytes = bytes,
+        .width = if (dims) |d| d.width else 0,
+        .height = if (dims) |d| d.height else 0,
+        .kind = kind,
+    };
+}
+
+pub fn fileName(gpa: std.mem.Allocator, stamp: anytype, kind: Format) ![]u8 {
+    return std.fmt.allocPrint(gpa, "rembrandt-{d}.{s}", .{ stamp, kind.api() });
 }
 
 pub fn errorMessage(arena: std.mem.Allocator, body: []const u8) []const u8 {

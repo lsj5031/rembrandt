@@ -9,6 +9,7 @@ const references = @import("references.zig");
 
 test {
     _ = @import("tests_generation.zig");
+    _ = @import("tests_formats.zig");
 }
 
 test "the prototype's anchors are on screen" {
@@ -92,6 +93,31 @@ test "a click outside the settings sheet closes it" {
     try std.testing.expect(!state.show_settings);
 }
 
+test "Backend request changes are discarded unless saved" {
+    var state = try app_view.State.initDefault(std.testing.allocator, std.testing.io);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(std.testing.allocator, .init(&state, app_view.State.view), .{ .width = 1240, .height = 820 });
+    defer t.deinit();
+    t.settle(0.2);
+    try t.clickText("server default");
+    t.settle(0.2);
+    try t.clickText("output: png");
+    try t.clickText("quality: auto");
+    t.settle(0.1);
+    try std.testing.expectEqual(backend.Format.gif, state.request_draft.format);
+    try std.testing.expectEqual(backend.Level.low, state.request_draft.quality);
+    try t.clickText("Cancel");
+    t.settle(0.2);
+    try std.testing.expectEqual(backend.Format.png, state.config.format);
+    try std.testing.expectEqual(backend.Level.auto, state.config.quality);
+    // Reopening starts from the saved values, not the discarded draft.
+    try t.clickText("server default");
+    t.settle(0.2);
+    try std.testing.expect(t.hasText("output: png"));
+    try std.testing.expect(t.hasText("quality: auto"));
+}
+
 test "a click inside the settings sheet leaves it open" {
     var state = try app_view.State.initDefault(std.testing.allocator, std.testing.io);
     defer state.deinit();
@@ -136,6 +162,44 @@ test "the request is valid JSON and keeps the prompt intact" {
     try std.testing.expectEqualStrings("1536x1024", root.object.get("size").?.string);
 }
 
+test "quality and complexity are opt-in and reach both endpoints" {
+    const gpa = std.testing.allocator;
+    var cfg = try backend.Config.defaults(gpa);
+    defer cfg.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const bare = try backend.buildBody(gpa, &cfg, "p");
+    defer gpa.free(bare);
+    const bare_root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, bare, .{});
+    try std.testing.expect(bare_root.object.get("quality") == null);
+    try std.testing.expect(bare_root.object.get("complexity") == null);
+
+    cfg.quality = .low;
+    cfg.complexity = .high;
+    const tuned = try backend.buildBody(gpa, &cfg, "p");
+    defer gpa.free(tuned);
+    const tuned_root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, tuned, .{});
+    try std.testing.expectEqualStrings("low", tuned_root.object.get("quality").?.string);
+    try std.testing.expectEqualStrings("high", tuned_root.object.get("complexity").?.string);
+
+    const inputs = [_]backend.RefInput{.{ .bytes = "\x89PNG\r\n\x1a\n", .mime = "image/png" }};
+    const edit = try backend.buildEditBody(gpa, &cfg, "p", &inputs);
+    defer gpa.free(edit);
+    const edit_root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, edit, .{});
+    try std.testing.expectEqualStrings("low", edit_root.object.get("quality").?.string);
+    try std.testing.expectEqualStrings("high", edit_root.object.get("complexity").?.string);
+
+    try std.testing.expectEqual(backend.Level.medium, backend.Level.parse("medium").?);
+    try std.testing.expect(backend.Level.parse("max") == null);
+    var level: backend.Level = .auto;
+    for ([_]backend.Level{ .low, .medium, .high, .auto }) |expected| {
+        level = level.cycle();
+        try std.testing.expectEqual(expected, level);
+    }
+}
+
 test "a bare host gets /v1; a full endpoint is normalized" {
     const gpa = std.testing.allocator;
     const a = try backend.normalize(gpa, "http://127.0.0.1:3425");
@@ -158,6 +222,11 @@ test "settings round-trip without the api key" {
     try config.setModel(gpa, "mitori/gpt-image-2.5-sunburst");
     try config.setKey(gpa, "sk-must-not-be-written");
     config.size = .portrait;
+    config.quality = .high;
+    config.complexity = .low;
+    config.format = .gif;
+    config.frames = 12;
+    config.frame_ms = 150;
 
     const json = try settings_store.encode(gpa, &config);
     defer gpa.free(json);
@@ -170,6 +239,37 @@ test "settings round-trip without the api key" {
     try std.testing.expectEqualStrings("https://relay.example.com/v1", loaded.base_url);
     try std.testing.expectEqualStrings("mitori/gpt-image-2.5-sunburst", loaded.model);
     try std.testing.expectEqual(backend.Size.portrait, loaded.size);
+    try std.testing.expectEqual(backend.Level.high, loaded.quality);
+    try std.testing.expectEqual(backend.Level.low, loaded.complexity);
+    try std.testing.expectEqual(backend.Format.gif, loaded.format);
+    try std.testing.expectEqual(@as(u8, 12), loaded.frames);
+    try std.testing.expectEqual(@as(u16, 150), loaded.frame_ms);
+}
+
+test "the Backend sheet cycles quality and complexity" {
+    var state = try app_view.State.initDefault(std.testing.allocator, std.testing.io);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(std.testing.allocator, .init(&state, app_view.State.view), .{ .width = 1240, .height = 820 });
+    defer t.deinit();
+    t.settle(0.2);
+    try t.clickText("server default");
+    t.settle(0.2);
+    try std.testing.expect(t.hasText("quality: auto"));
+    try t.clickText("quality: auto");
+    t.settle(0.1);
+    try std.testing.expectEqual(backend.Level.low, state.request_draft.quality);
+    try std.testing.expectEqual(backend.Level.auto, state.config.quality);
+    try std.testing.expect(t.hasText("quality: low"));
+    try t.clickText("complexity: auto");
+    t.settle(0.1);
+    try std.testing.expectEqual(backend.Level.low, state.request_draft.complexity);
+    try std.testing.expectEqual(backend.Level.auto, state.config.complexity);
+    try t.clickText("Save");
+    t.settle(0.1);
+    try std.testing.expect(!state.show_settings);
+    try std.testing.expectEqual(backend.Level.low, state.config.quality);
+    try std.testing.expectEqual(backend.Level.low, state.config.complexity);
 }
 
 pub const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -398,4 +498,25 @@ test "PNG thumbnail guard retains large references without decoding them" {
     std.mem.writeInt(u32, bytes[20..24], 1, .big);
     try refs.addBytes(gpa, "wide.png", &bytes);
     try std.testing.expect(!refs.items.items[2].canPreview());
+}
+
+test "quality and complexity come from the environment" {
+    const Env = struct {
+        value: []const u8,
+        pub fn get(env: @This(), name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "REMBRANDT_QUALITY")) return "high";
+            if (std.mem.eql(u8, name, "REMBRANDT_COMPLEXITY")) return "low";
+            if (std.mem.eql(u8, name, "REMBRANDT_FORMAT")) return "gif";
+            if (std.mem.eql(u8, name, "REMBRANDT_FRAMES")) return "12";
+            if (std.mem.eql(u8, name, "REMBRANDT_FRAME_MS")) return "150";
+            return if (std.mem.eql(u8, name, "REMBRANDT_SIZE")) env.value else null;
+        }
+    };
+    var cfg = try backend.Config.init(std.testing.allocator, Env{ .value = "" });
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(backend.Level.high, cfg.quality);
+    try std.testing.expectEqual(backend.Level.low, cfg.complexity);
+    try std.testing.expectEqual(backend.Format.gif, cfg.format);
+    try std.testing.expectEqual(@as(u8, 12), cfg.frames);
+    try std.testing.expectEqual(@as(u16, 150), cfg.frame_ms);
 }
